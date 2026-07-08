@@ -1159,10 +1159,14 @@ body.dark-mode select.form-control {
             <button class="btn btn-ghost btn-sm" onclick="showSheetsScript()">
               Voir le code Apps Script
             </button>
+            <button class="btn btn-ghost btn-sm" onclick="diagnosticSheets()" style="color:var(--purple);border-color:var(--purple);">
+              🔍 Diagnostiquer la connexion
+            </button>
           </div>
           <div style="margin-top:8px;font-size:11px;color:var(--text3);">
             Dernier envoi : <span id="last-sync-time">jamais</span> &nbsp;·&nbsp; Dernier chargement : <span id="last-load-time">jamais</span>
           </div>
+          <div id="sheets-diagnostic" style="margin-top:10px;"></div>
         </div>
 
         <!-- Telegram Bot -->
@@ -4531,8 +4535,14 @@ function syncSheet(ss, name, data, fields) {
   let sheet = ss.getSheetByName(name);
   if (!sheet) sheet = ss.insertSheet(name);
   sheet.clearContents();
+  // Forcer TOUTES les colonnes en format texte AVANT d'écrire, pour empêcher
+  // Google Sheets de convertir automatiquement les dates (YYYY-MM-DD) en objets Date
+  sheet.getRange(1, 1, data.length + 1, fields.length).setNumberFormat('@STRING@');
   sheet.appendRow(fields);
-  data.forEach(item => sheet.appendRow(fields.map(f => item[f] ?? '')));
+  data.forEach(item => sheet.appendRow(fields.map(f => {
+    const val = item[f];
+    return val === undefined || val === null ? '' : String(val);
+  })));
   // Mise en forme en-tête
   sheet.getRange(1, 1, 1, fields.length)
     .setBackground('#1C3F6E').setFontColor('#FFFFFF').setFontWeight('bold');
@@ -4590,7 +4600,10 @@ async function loadFromSheets(silent = false) {
   const urlFromField = (document.getElementById('param-sheets-url')||{}).value?.trim() || '';
   const url = urlFromField || urlFromDB;
 
+  console.log('[PERSHIRT] loadFromSheets() appelée — URL utilisée :', url || '(AUCUNE)');
+
   if (!url) {
+    console.warn('[PERSHIRT] Aucune URL Sheets configurée — chargement annulé.');
     if (!silent) { toast('URL Apps Script manquante — configurez-la d\'abord dans Paramètres', false); navigate('parametres'); }
     return false;
   }
@@ -4601,21 +4614,62 @@ async function loadFromSheets(silent = false) {
   try {
     const secret = DB.params.sheetsKey || (document.getElementById('param-sheets-key')||{}).value?.trim() || '';
     const sep = url.includes('?') ? '&' : '?';
-    const res = await fetch(url + sep + 'secret=' + encodeURIComponent(secret), { method: 'GET' });
+    const fullUrl = url + sep + 'secret=' + encodeURIComponent(secret);
+    console.log('[PERSHIRT] Requête GET vers :', fullUrl);
+
+    const res = await fetch(fullUrl, { method: 'GET' });
+    console.log('[PERSHIRT] Réponse HTTP reçue — status:', res.status, res.statusText);
 
     if (!res.ok) throw new Error(`HTTP ${res.status} — ${res.statusText}`);
 
+    const rawText = await res.text();
+    console.log('[PERSHIRT] Corps brut de la réponse (300 premiers car.) :', rawText.substring(0, 300));
+
     let data;
-    try { data = await res.json(); }
-    catch(e) { throw new Error('Réponse invalide — vérifiez le déploiement Apps Script'); }
+    try { data = JSON.parse(rawText); }
+    catch(e) {
+      console.error('[PERSHIRT] Échec du parsing JSON — la réponse n\'est pas un JSON valide.', e);
+      throw new Error('Réponse invalide (pas du JSON) — le Apps Script n\'est probablement pas encore redéployé avec le bon code');
+    }
+
+    console.log('[PERSHIRT] Données JSON reçues :', data);
 
     if (data.error) throw new Error(data.error);
 
     // Convertit les valeurs numériques stockées en texte dans le Sheet (total, avance, qte, etc.)
+    // ET parse les champs qui contiennent du JSON stringifié (items, tailles, couleurs, imgs, stockVariantes)
+    const JSON_FIELDS = ['items', 'tailles', 'couleurs', 'imgs', 'stockVariantes', 'pieces', 'commandesAffectees'];
+    const DATE_FIELDS = ['dateLivraison', 'dateCreation', 'date', 'rappelDate'];
     const toNum = v => (v === '' || v === undefined || v === null) ? 0 : (isNaN(Number(v)) ? v : Number(v));
+    // Google Sheets convertit parfois les dates en objets Date sérialisés (ex: "2026-02-19T23:00:00.000Z")
+    // au lieu du format YYYY-MM-DD attendu par les <input type="date"> et les filtres. On normalise ici.
+    const normalizeDate = (v) => {
+      if (!v || typeof v !== 'string') return v;
+      const isoMatch = v.match(/^(\d{4}-\d{2}-\d{2})T/);
+      if (isoMatch) return isoMatch[1];
+      return v;
+    };
     const cleanRow = (row) => {
       const out = {};
-      Object.entries(row).forEach(([k,v]) => { out[k] = toNum(v); });
+      Object.entries(row).forEach(([k,v]) => {
+        if (JSON_FIELDS.includes(k)) {
+          // Champ qui devrait être un tableau/objet — tenter de le parser s'il est stocké en texte
+          if (typeof v === 'string' && v.trim() !== '') {
+            try { out[k] = JSON.parse(v); }
+            catch(e) { out[k] = v; /* laisser tel quel si le parsing échoue */ }
+          } else if (v === '' || v === undefined || v === null) {
+            out[k] = undefined; // vide sur le Sheet = pas de valeur (on gardera la valeur locale existante)
+          } else {
+            out[k] = v; // déjà un tableau/objet (ne devrait pas arriver via Sheets mais sécurité)
+          }
+        } else if (DATE_FIELDS.includes(k)) {
+          out[k] = normalizeDate(v);
+        } else {
+          out[k] = toNum(v);
+        }
+      });
+      // Retirer les clés undefined pour ne pas écraser les données locales valides lors du merge
+      Object.keys(out).forEach(k => { if (out[k] === undefined) delete out[k]; });
       return out;
     };
 
@@ -4666,6 +4720,7 @@ async function loadFromSheets(silent = false) {
       imported += 1;
     }
 
+    console.log(`[PERSHIRT] Import terminé — ${imported} enregistrement(s) traité(s).`);
     saveDB();
 
     // Rafraîchir toutes les vues actives
@@ -4687,13 +4742,22 @@ async function loadFromSheets(silent = false) {
     return true;
 
   } catch (err) {
-    console.error('loadFromSheets error:', err);
+    console.error('[PERSHIRT] loadFromSheets ÉCHOUÉ :', err);
     let errMsg = err.message;
     if (errMsg.includes('Failed to fetch') || errMsg.includes('NetworkError')) {
-      errMsg = 'Erreur réseau — vérifiez que le Apps Script est déployé en accès "Tout le monde"';
+      errMsg = 'Erreur réseau/CORS — vérifiez que le Apps Script est déployé en accès "Tout le monde"';
     }
+    // Stocker la dernière erreur pour diagnostic (visible même après un chargement silencieux)
+    window._lastSheetsLoadError = errMsg;
     if (statusEl && !silent) statusEl.innerHTML = `<span style="color:var(--red)">✗ ${errMsg}</span>`;
-    if (!silent) toast('Erreur de chargement : ' + errMsg, false);
+    if (!silent) {
+      toast('Erreur de chargement : ' + errMsg, false);
+    } else {
+      // Même en mode silencieux (démarrage auto), on affiche un badge discret d'échec
+      const statusElAlways = document.getElementById('sheets-status');
+      if (statusElAlways) statusElAlways.innerHTML = `<span style="color:var(--red)">✗ Chargement auto échoué : ${errMsg}</span>`;
+      console.warn('[PERSHIRT] Le chargement automatique au démarrage a échoué. Ouvrez Paramètres > Google Sheets pour voir le détail, ou consultez la console (F12).');
+    }
     return false;
   }
 }
@@ -4771,6 +4835,74 @@ async function syncToSheets(silent = false) {
   }
 }
 
+// [NOUVEAU] Diagnostic complet — affiche la réponse brute exacte du Apps Script
+// pour identifier précisément pourquoi la synchronisation ne fonctionne pas
+async function diagnosticSheets() {
+  const url = DB.params.sheetsUrl || (document.getElementById('param-sheets-url')||{}).value?.trim();
+  const box = document.getElementById('sheets-diagnostic');
+  if (!url) { if(box) box.innerHTML = '<div style="color:var(--red);font-size:12px;">Aucune URL configurée.</div>'; return; }
+  if (box) box.innerHTML = '<div style="color:var(--yellow);font-size:12px;">⏳ Diagnostic en cours…</div>';
+
+  const key = DB.params.sheetsKey || (document.getElementById('param-sheets-key')||{}).value?.trim() || '';
+  const results = [];
+
+  // Test 1 : GET simple sans paramètres
+  try {
+    const res1 = await fetch(url);
+    const txt1 = await res1.text();
+    let isJson1 = false; try { JSON.parse(txt1); isJson1 = true; } catch(e){}
+    results.push({
+      test: 'GET simple (sans secret)',
+      status: res1.status,
+      isJson: isJson1,
+      preview: txt1.substring(0, 200),
+    });
+  } catch(e) {
+    results.push({ test: 'GET simple (sans secret)', error: e.message });
+  }
+
+  // Test 2 : GET avec secret et test=1
+  try {
+    const res2 = await fetch(`${url}?secret=${encodeURIComponent(key)}&test=1`);
+    const txt2 = await res2.text();
+    let isJson2 = false; try { JSON.parse(txt2); isJson2 = true; } catch(e){}
+    results.push({
+      test: 'GET avec secret + test=1',
+      status: res2.status,
+      isJson: isJson2,
+      preview: txt2.substring(0, 200),
+    });
+  } catch(e) {
+    results.push({ test: 'GET avec secret + test=1', error: e.message });
+  }
+
+  // Construire le rapport visuel
+  let html = '<div style="background:var(--surface2);border-radius:var(--radius);padding:14px;font-size:12px;">';
+  html += '<div style="font-weight:700;margin-bottom:10px;">📋 Rapport de diagnostic</div>';
+  html += `<div style="margin-bottom:8px;"><strong>URL testée :</strong><br><code style="word-break:break-all;font-size:10.5px;">${url}</code></div>`;
+
+  results.forEach(r => {
+    html += '<div style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);">';
+    html += `<div style="font-weight:600;">${r.test}</div>`;
+    if (r.error) {
+      html += `<div style="color:var(--red);">✗ Erreur réseau : ${r.error}</div>`;
+      html += `<div style="color:var(--text3);font-size:11px;margin-top:4px;">→ Vérifiez votre connexion internet, ou que l'URL est correcte.</div>`;
+    } else {
+      html += `<div>Status HTTP : <strong style="color:${r.status===200?'var(--green)':'var(--red)'}">${r.status}</strong></div>`;
+      html += `<div>Format JSON valide : <strong style="color:${r.isJson?'var(--green)':'var(--red)'}">${r.isJson ? 'Oui ✓' : 'Non ✗'}</strong></div>`;
+      html += `<div style="margin-top:4px;color:var(--text2);">Aperçu réponse :<br><code style="font-size:10px;word-break:break-all;background:var(--surface);padding:4px 6px;border-radius:4px;display:block;margin-top:2px;">${(r.preview||'').replace(/</g,'&lt;')}</code></div>`;
+      if (!r.isJson) {
+        html += `<div style="color:var(--red);margin-top:6px;font-weight:600;">→ Le script ne renvoie pas du JSON. Cela confirme qu'il faut redéployer le nouveau code Apps Script (bouton "Voir le code Apps Script" ci-dessus), puis Déployer → Gérer les déploiements → ✏️ → Nouvelle version.</div>`;
+      }
+    }
+    html += '</div>';
+  });
+  html += '</div>';
+
+  if (box) box.innerHTML = html;
+  console.log('[PERSHIRT] Résultats du diagnostic complet :', results);
+}
+
 async function testSheetsConnection() {
   const url = (document.getElementById('param-sheets-url')||{}).value?.trim();
   if (!url) { toast('Entrez d\'abord l\'URL', false); return; }
@@ -4778,13 +4910,37 @@ async function testSheetsConnection() {
   if (statusEl) statusEl.innerHTML = '<span style="color:var(--yellow)">⏳ Test en cours…</span>';
   try {
     const key = (document.getElementById('param-sheets-key')||{}).value?.trim()||'';
-    const res  = await fetch(`${url}?secret=${encodeURIComponent(key)}&test=1`);
-    const txt  = await res.text();
-    if (statusEl) statusEl.innerHTML = `<span style="color:var(--green)">✓ Connexion réussie</span>`;
+    const testUrl = `${url}?secret=${encodeURIComponent(key)}&test=1`;
+    console.log('[PERSHIRT] Test de connexion vers :', testUrl);
+
+    const res = await fetch(testUrl, { method: 'GET' });
+    const txt = await res.text();
+    console.log('[PERSHIRT] Réponse brute du test :', txt.substring(0, 400));
+
+    // Vérification réelle : la réponse doit être du JSON valide, pas une page d'erreur Google
+    let data;
+    try {
+      data = JSON.parse(txt);
+    } catch(e) {
+      // Ce n'est pas du JSON — probablement une page d'erreur Google ou un ancien script non redéployé
+      if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">✗ Réponse invalide (pas du JSON). Le script n'est probablement pas encore redéployé avec le bon code, ou l'accès n'est pas "Tout le monde".</span>`;
+      toast('Échec : réponse invalide du Apps Script — vérifiez le déploiement', false);
+      console.error('[PERSHIRT] La réponse n\'est pas du JSON. Contenu complet :', txt);
+      return;
+    }
+
+    if (data.error) {
+      if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">✗ Erreur retournée par le script : ${data.error}</span>`;
+      toast('Erreur Apps Script : ' + data.error, false);
+      return;
+    }
+
+    if (statusEl) statusEl.innerHTML = `<span style="color:var(--green)">✓ Connexion réussie — le script répond correctement en JSON</span>`;
     toast('Connexion Google Sheets OK ✓');
   } catch (err) {
-    if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">✗ ${err.message}</span>`;
-    toast('Connexion échouée', false);
+    console.error('[PERSHIRT] testSheetsConnection erreur réseau :', err);
+    if (statusEl) statusEl.innerHTML = `<span style="color:var(--red)">✗ Erreur réseau : ${err.message}</span>`;
+    toast('Connexion échouée : ' + err.message, false);
   }
 }
 
