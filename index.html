@@ -2493,6 +2493,13 @@ function navigate(page) {
 function openModal(id) { document.getElementById(id).classList.add('open'); }
 function closeModal(id) { document.getElementById(id).classList.remove('open'); }
 
+// [CORRECTION BUG] Déclaration explicite des instances Chart.js.
+// Sans ce `let`, les IDs "chartCA" et "chartStatut" des balises <canvas>
+// créent des variables globales implicites (chartCA = l'élément <canvas> lui-même),
+// ce qui provoque l'erreur "chartCA.destroy is not a function" au premier rendu.
+let chartCA = null;
+let chartStatut = null;
+
 function renderDashboard() {
   const now = new Date();
 
